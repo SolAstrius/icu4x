@@ -1,0 +1,173 @@
+# Fork-only workflow (SolAstrius/icu4x). Not part of upstream ICU4X.
+#
+# Publishes selected ICU4X crates as standalone branches `crate/<crate>`, each
+# containing only the `cargo package` output of that crate at the root, so the
+# crate can be used as a small git dependency without cloning the monorepo:
+#
+#   calendrical_calculations = { git = "https://github.com/SolAstrius/icu4x", branch = "crate/calendrical_calculations" }
+#
+# Each new crate version is also tagged `crate/<crate>/v<version>`.
+#
+# On schedule (and on manual dispatch unless disabled) the fork's `main` is
+# first synced from unicode-org/icu4x, and every workflow except this one is
+# (re-)disabled so that upstream's CI never runs in the fork.
+#
+# This workflow deliberately uses no third-party or GitHub-hosted actions
+# (only shell, git, gh and cargo): the fork's Actions policy is "local actions
+# only", which makes upstream workflows fail at startup should one ever get
+# enabled, while this one keeps working.
+
+name: Fork - publish crate branches
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sync_upstream:
+        description: "Sync main from unicode-org/icu4x before publishing"
+        type: boolean
+        default: true
+  schedule:
+    - cron: "23 4 * * *"
+
+permissions: {}
+
+concurrency:
+  group: fork-crate-branches
+  cancel-in-progress: false
+
+env:
+  # Space-separated list of workspace crates to publish. Add more here,
+  # e.g. "calendrical_calculations ixdtf icu_calendar".
+  CRATES: "calendrical_calculations"
+  UPSTREAM: unicode-org/icu4x
+  THIS_WORKFLOW: .github/workflows/fork-crate-branches.yml
+
+jobs:
+  sync-upstream:
+    name: Sync main from upstream
+    if: github.repository != 'unicode-org/icu4x' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.sync_upstream))
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write   # disable upstream workflows
+      contents: write  # merge upstream into main
+    steps:
+      - name: Disable all workflows except this one
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api --paginate "repos/$REPO/actions/workflows" \
+            --jq ".workflows[] | select(.state == \"active\" and .path != \"$THIS_WORKFLOW\") | \"\(.id) \(.path)\"" |
+          while read -r id wf_path; do
+            echo "Disabling $wf_path"
+            gh api -X PUT "repos/$REPO/actions/workflows/$id/disable"
+          done
+
+      - name: Merge upstream main into main
+        env:
+          # GITHUB_TOKEN cannot update files under .github/workflows, so a sync
+          # that brings in upstream workflow changes fails with it. Add a
+          # fine-grained PAT (Contents + Workflows: read/write on this repo) as
+          # the SYNC_TOKEN secret to make such syncs work unattended.
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api -X POST "repos/$REPO/merge-upstream" -f branch=main
+
+  publish:
+    name: Publish crate branches
+    needs: sync-upstream
+    # Run even if the sync was skipped (push) or failed (publish current main).
+    if: ${{ !cancelled() && github.repository != 'unicode-org/icu4x' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # push crate/* branches and tags
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Check out main
+        run: |
+          git init -q src
+          cd src
+          git config --local http.https://github.com/.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git remote add origin "https://github.com/$REPO.git"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            src_sha="$GITHUB_SHA"
+          else
+            # main may have just been advanced by the sync job.
+            src_sha=$(git ls-remote origin refs/heads/main | cut -f1)
+          fi
+          git fetch -q --depth=1 origin "$src_sha"
+          git checkout -q --detach FETCH_HEAD
+          echo "SRC_SHA=$src_sha" >> "$GITHUB_ENV"
+          echo "Source: $REPO@$src_sha"
+
+      - name: Package and publish crates
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Installs the toolchain pinned in rust-toolchain.toml on first use.
+          cargo --version
+          meta=$(cargo metadata --no-deps --format-version 1)
+
+          refspecs=()
+          for crate in $CRATES; do
+            echo "::group::$crate"
+            version=$(jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version' <<<"$meta")
+            [ -n "$version" ] || { echo "::error::crate $crate not found in workspace"; exit 1; }
+            branch="crate/$crate"
+            tag="crate/$crate/v$version"
+
+            cargo package -p "$crate" --no-verify
+            out=$(mktemp -d)
+            tar -xzf "target/package/$crate-$version.crate" -C "$out"
+            pkg_dir="$out/$crate-$version"
+            # Contains the source commit hash, which would make every run a
+            # change; the hash is recorded in the commit message instead.
+            rm -f "$pkg_dir/.cargo_vcs_info.json"
+
+            # Build the tree in a private index, independent of the checkout.
+            export GIT_INDEX_FILE="$out/index"
+            git --git-dir="$PWD/.git" --work-tree="$pkg_dir" -C "$pkg_dir" add -A -f .
+            tree=$(git write-tree)
+            unset GIT_INDEX_FILE
+
+            parent=""
+            if git fetch -q --depth=1 origin "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null; then
+              parent=$(git rev-parse "refs/remotes/origin/$branch")
+            fi
+
+            if [ -n "$parent" ] && [ "$(git rev-parse "$parent^{tree}")" = "$tree" ]; then
+              echo "$crate $version: unchanged"
+              head="$parent"
+            else
+              msg="$crate $version
+
+          cargo package output of $crate from $REPO@$SRC_SHA
+          (https://github.com/$REPO/commit/$SRC_SHA)."
+              head=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "$msg")
+              echo "$crate $version: new commit $head"
+              refspecs+=("$head:refs/heads/$branch")
+            fi
+
+            if git ls-remote --exit-code origin "refs/tags/$tag" >/dev/null; then
+              echo "tag $tag already exists"
+            else
+              git tag -a "$tag" "$head" -m "$crate $version (from $REPO@$SRC_SHA)"
+              refspecs+=("refs/tags/$tag:refs/tags/$tag")
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ ${#refspecs[@]} -gt 0 ]; then
+            git push --atomic origin "${refspecs[@]}"
+          else
+            echo "Nothing to push."
+          fi
